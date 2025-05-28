@@ -8,9 +8,11 @@ import json
 from datetime import datetime, timedelta
 import pytz
 
+# get configuration data
 config_json = open('config.json')
 config_data = json.loads(config_json.read())
 
+# read configuration data into individual variables
 api_key_openweather = config_data['api_key_openweather']
 api_key_rapidapi = config_data['api_key_rapidapi']
 schema = "gans"
@@ -20,6 +22,7 @@ password = config_data['mysql_passwd']
 port = 3306
 connection_string = f'mysql+pymysql://{user}:{password}@{host}:{port}/{schema}'
 
+# get all currently available weather data at (lon, lat)
 def get_weather_data(lon, lat):
     url = "https://api.openweathermap.org/data/2.5/forecast"
     header={"X-Api-Key": api_key_openweather}
@@ -33,7 +36,10 @@ def get_weather_data(lon, lat):
         return []
     return weather_json['list']
 
+# extract weather data for a single time period (of 3 h)
+# returns a list of relevant data
 def extract_data_single(forecast):
+    # 'rain' only available if it is actually raining
     if 'rain' in forecast.keys():
         rain = forecast['rain']['3h']
     else:
@@ -60,11 +66,13 @@ def extract_data(forecasts, upto=-1):
         columns=['timestamp', 'temperature', 'feeled_temperature', 'humidity', 'overall', 'clouds', 'windspeed', 'rain', 'visibility']
     )
     if -1 != upto:
+        # -1: extract all data
         forecasts = forecasts[:upto]
     for forecast in forecasts:
         weather_df.loc[len(weather_df)] = extract_data_single(forecast)
     return weather_df
 
+# update the population for the city in row 'row' of the cities data table
 def update_population_for_city(row):
     soup = get_wikipedia(row['city'])
     population_df = pd.DataFrame({'city_id': [], 'population': [], 'year_retrieved': []})
@@ -75,26 +83,31 @@ def update_population_for_city(row):
                             con=connection_string,
                             index=False)
 
+# update the population for all cities in the cities data table
 def update_population():
     cities_from_sql = pd.read_sql("cities", con=connection_string)
     cities_from_sql.apply(update_population_for_city, axis=1)
 
+# download Wikipedia data on 'city'
 def get_wikipedia(city):
     url = "https://en.wikipedia.org/wiki/" + city
     response = requests.get(url)
     return BeautifulSoup(response.content, 'html.parser')
-    
+
+# extract population data from Wikipedia
 def get_population(soup_wiki):
     population = -1
     for infobox_label in soup_wiki.find_all(class_='infobox-label'):
         if (infobox_label.get_text().startswith('Population')):
             population = int(infobox_label.find_next(class_='infobox-data').get_text().replace(',', ''))
+    # if nothing was found, try another approach
     if (-1 == population):
         for infobox_header in soup_wiki.find_all(class_='infobox-header'):
             if (infobox_header.get_text().startswith('Population')):
                 population = int(infobox_header.find_next(class_='infobox-data').get_text().replace(',', ''))
     return population
-    
+
+# add a new city to the cities data table
 def add_city(city):
     cities_from_sql = pd.read_sql("cities", con=connection_string)
     if city in cities_from_sql.loc[:, 'city'].values:
@@ -102,8 +115,10 @@ def add_city(city):
 
     df = pd.DataFrame({'city': [], 'longitude': [], 'latitude': [], 'country': [], 'population': [], 'tz': []})
     soup_wiki = get_wikipedia(city)
+    # Turn a°b'c'' into a decimal number
     match = re.search(r'(\d+)°(\d+)′((\d+)″)?(\w)', soup_wiki.find(class_='latitude').get_text())
     lat = float(match.group(1)) + float(match.group(2))/60
+    # seconds not always present
     if match.group(4):
         lat += float(match.group(4))/3600
     if 'N' != match.group(5):
@@ -116,6 +131,7 @@ def add_city(city):
         long = -long;
 
     for infobox_label in soup_wiki.find_all(class_='infobox-label'):
+        # Mostly the state of the city is 'Country', but for UK it's Sovereign state, while country is 'England'
         if (infobox_label.get_text() == 'Sovereign state'):
             country = infobox_label.find_next(class_='infobox-data').get_text().strip()
             break
@@ -123,21 +139,11 @@ def add_city(city):
             country = infobox_label.find_next(class_='infobox-data').get_text().strip()
 
     population = get_population(soup_wiki)
-    
-    for infobox_label in soup_wiki.find_all(class_='infobox-label'):
-        if (infobox_label.get_text().startswith('Time zone')):
-            match = re.search(r'.*\((\w+)\).*', infobox_label.find_next(class_='infobox-data').get_text())
-            tz = match.group(1)
 
-    #url_tz = 'https://utctime.info/timezone/'
-    #response_tz = requests.get(url_tz)
-    #soup_tz = BeautifulSoup(response_tz.content, 'html.parser')
-    #for tag in soup_tz.find_all():
-    #    if tag.get_text() == tz:
-    #        tag = tag.find_previous('a')
-    #        print(tag.get_text())
- 
+    # get airports and time zones from API
     airport_list, tz = get_airports(lon=long, lat=lat)
+
+    # add a new row to our local pandas frame
     new_row = {'city': city,
                 'longitude': long,
                 'latitude': lat,
@@ -147,43 +153,48 @@ def add_city(city):
                 }
     df.loc[len(df)] = new_row
 
-
+    # extract just the 'city' column and send it to the 'cities' data table in SQL
     df.loc[:, 'city'].to_sql('cities',
                                 if_exists='append',
                                 con=connection_string,
                                 index=False)
 
+    # read back 'cities' data table to get the city_id of the newly added city
     cities_from_sql = pd.read_sql("cities", con=connection_string)
 
+    # merge city_id into our local data frame
     merged_df = df.merge(cities_from_sql, on = 'city', how='left')
 
+    # population data table just needs city_id, population and the year of retrival
     population_df = merged_df.drop(columns=['city', 'longitude', 'latitude', 'country', 'tz'])
+    # fill column with the current year
     population_df['year_retrieved']=[2025 for i in range(0, merged_df.shape[0])]
     population_df.to_sql('population',
                             if_exists='append',
                             con=connection_string,
                             index=False)
 
+    # geo doesn't need city or population
     merged_df.drop(columns=['city', 'population']).to_sql('geo',
                                                             if_exists='append',
                                                             con=connection_string,
                                                             index=False)
 
+    # if airports were found, add them to the table
     if len(airport_list) != 0:
         city_id = cities_from_sql.loc[cities_from_sql.loc[:, 'city'] == city, 'city_id'].iloc[0]
+        # same city_id for all airports
         airport_df = pd.DataFrame({'city_id': [city_id for i in range(0, len(airport_list))],
                                     'icao': airport_list})
         airport_df.to_sql('airports', if_exists='append', con=connection_string, index=False)
         
-
-
-
-
+# update cities
 def update_tables(cities):
     cities_from_sql = pd.read_sql("cities", con=connection_string)
     geo = pd.read_sql('geo', con=connection_string)
     for city in cities:
         print(f"Processing {city}");
+        # if new city, add it
         if not city in cities_from_sql.loc[:, 'city'].values:
             try:
                 add_city(city)
@@ -193,6 +204,7 @@ def update_tables(cities):
                 """
                     Do nothing
                 """
+        # ignore cities, you cannot webscrape
         if not city in cities_from_sql.loc[:, 'city'].values:
             print(f"{city} not in DB, update DB not possible")
             continue
