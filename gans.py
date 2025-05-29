@@ -137,6 +137,7 @@ def add_city(city):
             break
         elif (infobox_label.get_text() == 'Country'):
             country = infobox_label.find_next(class_='infobox-data').get_text().strip()
+            break
 
     population = get_population(soup_wiki)
 
@@ -168,7 +169,7 @@ def add_city(city):
     # population data table just needs city_id, population and the year of retrival
     population_df = merged_df.drop(columns=['city', 'longitude', 'latitude', 'country', 'tz'])
     # fill column with the current year
-    population_df['year_retrieved']=[2025 for i in range(0, merged_df.shape[0])]
+    population_df['year_retrieved']=[datetime.now().year for i in range(0, merged_df.shape[0])]
     population_df.to_sql('population',
                             if_exists='append',
                             con=connection_string,
@@ -211,13 +212,17 @@ def update_tables(cities):
         city_id = cities_from_sql.loc[cities_from_sql.loc[:, 'city'] == city, 'city_id'].iloc[0]
         lat = geo.loc[geo.loc[:, 'city_id']==city_id, 'latitude'].iloc[0]
         lon = geo.loc[geo.loc[:, 'city_id']==city_id, 'longitude'].iloc[0]
+        # get all weather data
         wjson = get_weather_data(lat=lat, lon=lon)
-        wdf = extract_data(wjson, 2)
+        # extract data for next 8*3 hours
+        wdf = extract_data(wjson, 8)
+        # add city_id column
         wdf['city_id']=[city_id for i in range(0, wdf.shape[0])]
         wdf.to_sql('weather',
                     if_exists='append',
                     con=connection_string,
                     index=False)
+        # get airports for the current city
         airports_from_sql = pd.read_sql('airports', con=connection_string)
         airports_from_sql = airports_from_sql.loc[airports_from_sql.loc[:, 'city_id']==city_id]
         for ts in wdf.loc[:, 'timestamp']:
@@ -227,8 +232,11 @@ def update_tables(cities):
                 tz = geo.loc[geo.loc[:, 'city_id']==city_id, 'tz'].iloc[0]
                 get_flights(airport, query_time, tz)
 
+# get arrivals at airport 'airport' in time zone 'timezone' from UTC time 'utc_time' within next 3 h
 def get_flights(airport, utc_time, timezone):
+    # convert start time to local time
     start_local = utc_time.astimezone(pytz.timezone(timezone)).strftime("%Y-%m-%dT%H:%M")
+    # end tiem is 3 h later
     end_utc = utc_time + timedelta(hours=3)
     end_local = end_utc.astimezone(pytz.timezone(timezone)).strftime("%Y-%m-%dT%H:%M")
     url = f"https://aerodatabox.p.rapidapi.com/flights/airports/icao/{airport}/{start_local}/{end_local}"
@@ -239,12 +247,16 @@ def get_flights(airport, utc_time, timezone):
     }
     response = requests.get(url, headers=headers, params=querystring)
 
+    # check for success
     if 200 == response.status_code:
         json=response.json()
 
         format = '%Y-%m-%d %H:%MZ'
+        # list of airports of origin, sometimes no icao code is given, therefore just use names
         froms = [ arrival['movement']['airport']['name'] for arrival in json['arrivals']]
+        # list of arrival times
         arrivals = [ datetime.strptime(arrival['movement']['scheduledTime']['utc'], format) for arrival in json['arrivals']]
+        # build data frame from icao column (always our current airport), froms and arrivals
         flights_df = pd.DataFrame({'icao': [airport for i in range(0, len(arrivals))],
                                     'arrival': arrivals,
                                     'fromWhere': froms})
@@ -253,7 +265,7 @@ def get_flights(airport, utc_time, timezone):
                     con=connection_string,
                     index=False)
 
-
+# find airports within 50 km of (lon, lat)
 def get_airports(lon, lat):
     url = "https://aerodatabox.p.rapidapi.com/airports/search/location"
     querystring = {"lat":str(lat),"lon":str(lon),"radiusKm":"50","limit":"10","withFlightInfoOnly":"true"}
@@ -265,6 +277,7 @@ def get_airports(lon, lat):
     airports = response.json()['items']
     return [ airport['icao'] for airport in airports ], airports[0]['timeZone']
 
+# if script is run with paramter '_population' update population parameter, else process city list
 if '_population' == sys.argv[1]:
     update_population()
 else:
